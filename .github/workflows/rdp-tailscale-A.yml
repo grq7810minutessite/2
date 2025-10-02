@@ -85,9 +85,11 @@ jobs:
         id: decide
         run: |
           # Hostname (matrix-aware)
-          if ($env:Matrix_Id) { $hn = "bullet$($env:Matrix_Id)" } else { $hn = "bullet" }
-          if (-not $env:Matrix_Id) { $env:Matrix_Id = "${{ matrix.id }}" }
-          if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" }
+          if ("${{ inputs.rdp_count }}" -gt 1) {
+            $hn = "bullet${{ matrix.id }}"
+          } else {
+            $hn = "bullet"
+          }
           "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Hostname: $hn"
 
@@ -141,22 +143,17 @@ jobs:
           "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Tailscale IPv4: $ip4"
 
-      # -------- CRD: install (if needed) + run, WHEN crd_code provided (still keep RustDesk/RDP on) --------
+      # -------- CRD: install (if needed) + run, WHEN crd_code provided (keep RustDesk/RDP ON) --------
       - name: Install Chrome Remote Desktop Host (if missing)
         if: env.CRD_ENABLED == '1'
         run: |
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
             Write-Host "CRD host not found, installing..."
-            $msi = "$env:TEMP\chromeremotedesktophost.msi"
-            try {
-              # Official host MSI (fallback if path missing)
-              Invoke-WebRequest -Uri "https://dl.google.com/dl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
-              Remove-Item $msi -Force
-            } catch {
-              Write-Error "CRD host install failed: $($_.Exception.Message)"
-            }
+            $exePath = "$env:TEMP\chromeremotedesktophost.exe"
+            Invoke-WebRequest -Uri "https://dl.google.com/support/remote_assistance/ChromotingHostSetup.exe" -OutFile $exePath
+            Start-Process -FilePath $exePath -ArgumentList "/silent","/install" -Wait
+            Remove-Item $exePath -Force
           } else {
             Write-Host "CRD host already installed."
           }
