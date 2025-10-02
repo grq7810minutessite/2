@@ -150,10 +150,10 @@ jobs:
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
             Write-Host "CRD host not found, installing..."
-            $exePath = "$env:TEMP\chromeremotedesktophost.exe"
-            Invoke-WebRequest -Uri "https://dl.google.com/support/remote_assistance/ChromotingHostSetup.exe" -OutFile $exePath
-            Start-Process -FilePath $exePath -ArgumentList "/silent","/install" -Wait
-            Remove-Item $exePath -Force
+            $installer = "$env:TEMP\chromeremotedesktophost.exe"
+            Invoke-WebRequest -Uri "https://dl.google.com/support/remote_assistance/ChromotingHostSetup.exe" -OutFile $installer
+            Start-Process -FilePath $installer -ArgumentList "/silent","/install" -Wait
+            Remove-Item $installer -Force
           } else {
             Write-Host "CRD host already installed."
           }
