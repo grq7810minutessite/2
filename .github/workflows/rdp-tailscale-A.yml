@@ -34,8 +34,9 @@ on:
         default: "1"
       crd_code:
         description: >-
-          Paste either the raw CRD code (e.g. 4/0AV...) OR the full remoting_start_host.exe command.
-          If provided -> forces single instance, and runs CRD + RustDesk/RDP together.
+          Paste raw CRD code (4/0AV...), OR full remoting_start_host.exe command,
+          OR text/URL containing --code="4/...". If provided -> forces single instance and
+          launches CRD first (then RustDesk/RDP continues).
         required: false
         default: ""
 
@@ -71,7 +72,7 @@ jobs:
 
   rdp:
     needs: setup
-    runs-on: windows-latest   # switch to windows-2025 if your org supports it
+    runs-on: windows-latest   # change to windows-2025 if available in your org
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
@@ -81,70 +82,14 @@ jobs:
       RDP_PASS: Bullet@12345
 
     steps:
-      - name: Decide flags + hostname + runtime
-        id: decide
+      # --- CRD FAST PATH (launch first to beat code timeout) ---
+      - name: Set CRD flag early
         run: |
-          # Hostname (matrix-aware)
-          if ("${{ inputs.rdp_count }}" -gt 1) {
-            $hn = "bullet${{ matrix.id }}"
-          } else {
-            $hn = "bullet"
-          }
-          "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Hostname: $hn"
-
-          # Runtime clamp
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
-          function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
-          $runtime = IntOr("${{ inputs.runtime_minutes }}",355)
-          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
-          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
-          if ($runtime -gt 360) { $runtime = 355 }
-          "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Runtime minutes: $runtime"
-
-          # Detect CRD presence
           $crd = "${{ inputs.crd_code }}".Trim()
           if ($crd.Length -gt 0) { "CRD_ENABLED=1" | Out-File -Append $env:GITHUB_ENV } else { "CRD_ENABLED=0" | Out-File -Append $env:GITHUB_ENV }
           Write-Host "CRD_ENABLED=$([int]($crd.Length -gt 0))"
 
-      - name: Purge bullet* devices (optional)
-        run: |
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
-          if (Yes("${{ inputs.do_purge }}")) {
-            try {
-              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-              $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-              $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-              foreach($d in $list.devices){
-                if ($d.hostname -match '^bullet[0-9]*$'){
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                }
-              }
-              Write-Host "Purged bullet* devices (if any)."
-            } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
-          } else {
-            Write-Host "Purge disabled."
-          }
-
-      - name: Install + Up Tailscale
-        run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $ts)) {
-            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-            $dst = "$env:TEMP\tailscale.msi"
-            Invoke-WebRequest -Uri $url -OutFile $dst
-            Start-Process msiexec.exe -ArgumentList "/i", "`"$dst`"", "/quiet", "/norestart" -Wait
-            Remove-Item $dst -Force
-          }
-          & $ts logout | Out-Null
-          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
-          $ip4 = & $ts ip -4 | Select-Object -First 1
-          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Tailscale IPv4: $ip4"
-
-      # -------- CRD: install (if needed) + run, WHEN crd_code provided (keep RustDesk/RDP ON) --------
-      - name: Install Chrome Remote Desktop Host (if missing)  # with EXE -> MSI fallback
+      - name: Install Chrome Remote Desktop Host (if missing)  # EXE -> MSI fallback
         if: env.CRD_ENABLED == '1'
         run: |
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
@@ -181,35 +126,131 @@ jobs:
             Write-Host "CRD host already installed."
           }
 
-      - name: Run Chrome Remote Desktop (accept raw code or full command)
+      - name: Run Chrome Remote Desktop (accept raw code / full cmd / url)
         if: env.CRD_ENABLED == '1'
         run: |
           $raw = "${{ inputs.crd_code }}".Trim()
+
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
             Write-Error "remoting_start_host.exe not found after install attempt."
             exit 1
           }
 
-          # If user pasted a full command, run it as-is; else treat as code and build args.
-          $isFull = ($raw -match 'remoting_start_host\.exe') -or ($raw -match '--code=')
+          # Normalize: support raw code, full command, or a pasted string/URL containing --code="4/..."
+          $code = $null
+          $isFull = $false
+
+          if ($raw -match 'remoting_start_host\.exe') {
+            $isFull = $true
+          } elseif ($raw -match '--code\s*=\s*"?4\/[A-Za-z0-9_\-]+' ) {
+            $m = [regex]::Match($raw, '--code\s*=\s*"?([^"\s]+)')
+            if ($m.Success) { $code = $m.Groups[1].Value }
+          } elseif ($raw -match '^4\/') {
+            $code = $raw
+          }
 
           if ($isFull) {
-            # Write full command to ps1 to avoid quoting issues, then execute
+            # Run the full command exactly as provided, via temp PS1 to avoid quoting issues
             $tmp = "$env:TEMP\crd_full.ps1"
             Set-Content -Path $tmp -Value $raw -Encoding UTF8
             powershell -ExecutionPolicy Bypass -File $tmp
           } else {
-            # Treat raw as the code only
-            $code = $raw
+            if (-not $code) { Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or a string containing --code=\"4/...\""; exit 1 }
             $redir = "https://remotedesktop.google.com/_/oauthredirect"
             $name  = $Env:COMPUTERNAME
             $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""")
             Start-Process -FilePath $exe -ArgumentList $args
           }
-          Write-Host "CRD launched."
 
-      # -------- RustDesk / RDP (always on; CRD does NOT disable these) --------
+          Write-Host "CRD launch step completed."
+
+      - name: Verify CRD registration (service + recent logs)
+        if: env.CRD_ENABLED == '1'
+        run: |
+          # Wait briefly for host registration
+          $svcName = "Chrome Remote Desktop Service"
+          $deadline = (Get-Date).AddSeconds(60)
+          $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -in 'Running','StartPending') { $ok = $true; break }
+            Start-Sleep -Seconds 3
+          }
+
+          if ($ok) {
+            Write-Host "[$svcName] status: Running or starting."
+          } else {
+            Write-Warning "[$svcName] not running yet."
+          }
+
+          # Print recent CRD logs (best-effort)
+          $logDir = "$env:ProgramData\Google\Chrome Remote Desktop"
+          if (Test-Path $logDir) {
+            Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
+              Write-Host "----- LOG: $($_.FullName) -----"
+              Get-Content $_.FullName -Tail 200
+            }
+          } else {
+            Write-Host "CRD log directory not found: $logDir"
+          }
+
+          Write-Host "If the host doesn't appear in https://remotedesktop.google.com/access:"
+          Write-Host " - Ensure the code hasn't expired and matches your Google account session."
+          Write-Host " - Check org/policy blocks."
+          Write-Host " - Inspect logs above for auth/policy errors."
+
+      # --- Rest of the flow (after CRD is launched) ---
+      - name: Decide hostname + runtime
+        run: |
+          if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" } else { $hn = "bullet" }
+          "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Hostname: $hn"
+
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
+          $runtime = IntOr("${{ inputs.runtime_minutes }}",355)
+          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
+          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+          "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Runtime minutes: $runtime"
+
+      - name: Purge bullet* devices (optional)
+        run: |
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          if (Yes("${{ inputs.do_purge }}")) {
+            try {
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+              $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
+              foreach($d in $list.devices){
+                if ($d.hostname -match '^bullet[0-9]*$'){
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
+                }
+              }
+              Write-Host "Purged bullet* devices (if any)."
+            } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
+          } else {
+            Write-Host "Purge disabled."
+          }
+
+      - name: Install + Up Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$dst`"", "/quiet", "/norestart" -Wait
+            Remove-Item $dst -Force
+          }
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IPv4: $ip4"
+
       - name: Enable RDP user + firewall
         run: |
           $u=$env:RDP_USER; $p=$env:RDP_PASS
