@@ -1,4 +1,4 @@
-name: RDP via Tailscale + RustDesk + optional CRD/Avica/Portable Browsers
+name: RDP via Tailscale + (optional) CRD (Workflow A)
 
 on:
   workflow_dispatch:
@@ -12,34 +12,34 @@ on:
       ts_authkey:
         description: "Tailscale Auth key (reusable or ephemeral)"
         required: true
-      quick_test:
-        description: "Run 5-minute test"
+      test_mode:
+        description: "Run 5-minute test (otherwise ~6 hours)"
         type: boolean
         default: false
-      runtime_minutes:
-        description: "Runtime (max 360; default 355 when not test)"
-        required: false
-        default: "355"
-      do_purge:
-        description: "Purge bullet* devices at start and end"
-        required: false
-        default: "true"
+      multi_rdp:
+        description: "Launch multiple parallel RDP (bullet1..N)"
+        type: boolean
+        default: false
       rdp_count:
-        description: "How many RDP instances (1-10) for naming only"
+        description: "How many RDP when multi_rdp=true (max 10)"
         required: false
         default: "1"
-      cycles:
-        description: "0=stop after this run; N=handoffs left incl. this run"
+      purge_bullet:
+        description: "Purge bullet* devices at start/end"
+        required: false
+        default: "true"
+      runtime_minutes:
+        description: "Manual override (ignored unless >0). Test=5, normal=355"
         required: false
         default: "0"
+      install_rustdesk:
+        description: "Install + launch RustDesk"
+        type: boolean
+        default: true
       crd_code:
-        description: "Paste Chrome Remote Desktop one-line PowerShell command (optional)"
+        description: "Chrome Remote Desktop one-time CODE only (e.g. 4/0AVGzR1...)"
         required: false
         default: ""
-      extras:
-        description: "Comma list: avica,browsers,rustdesk (e.g. avica,browsers,rustdesk)"
-        required: false
-        default: "rustdesk"
 
 permissions:
   contents: read
@@ -58,67 +58,99 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 370
     env:
-      RDP_USER: Bullettemporary
-      RDP_PASS: Bullet@12345
-      BASE_PREFIX: bullet
-      X_DIR: C:\Users\Public\Transfer
+      RDP_USER:    Bullettemporary
+      RDP_PASS:    Bullet@12345
+      BASE_HOST:   bullet
+      X_DIR:       C:\Users\Public\Transfer
 
     steps:
       - name: Set up job
         run: |
-          $ErrorActionPreference = "Stop"
-          Write-Host "Start A workflow"
+          Write-Host "Runner: $env:RUNNER_OS $env:ImageOS"
 
-      - name: Decide hostname
+      - name: Compute hostname
         id: host
         run: |
           function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
-          $cnt  = IntOr("${{ inputs.rdp_count }}",1)
-          if($cnt -lt 1){ $cnt = 1 } elseif($cnt -gt 10){ $cnt = 10 }
-          $idx  = 1
-          $name = if($cnt -eq 1){ "${env:BASE_PREFIX}" } else { "${env:BASE_PREFIX}$idx" }
-          "host=$name"  | Out-File $env:GITHUB_OUTPUT -Append
-          "count=$cnt"  | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Hostname: $name  (count=$cnt)"
-
-      - name: Setup Tailscale and RDP and purge at start
-        env:
-          TS_HOSTNAME: ${{ steps.host.outputs.host }}
-        run: |
-          $ErrorActionPreference = "Stop"
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
-          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
 
-          $tailnet = "${{ inputs.ts_tailnet }}"
-          $apiKey  = "${{ inputs.ts_api_key }}"
-          $authKey = "${{ inputs.ts_authkey }}"
-          $test    = Yes("${{ inputs.quick_test }}")
-          $mins    = IntOr("${{ inputs.runtime_minutes }}",355)
-          if($test){ $mins = 5 } elseif($mins -lt 6){ $mins = 355 }
-          if($mins -gt 360){ $mins = 355 }
-          Write-Host "Runtime (minutes): $mins"
+          $test = Yes("${{ inputs.test_mode }}")
+          $multi = Yes("${{ inputs.multi_rdp }}")
+          $count = IntOr("${{ inputs.rdp_count }}", 1)
+          if($count -lt 1){ $count = 1 }
+          if($count -gt 10){ $count = 10 }
 
-          $doPurge = Yes("${{ inputs.do_purge }}")
-          $prefix  = "${env:BASE_PREFIX}"
+          $rtIn = IntOr("${{ inputs.runtime_minutes }}", 0)
+          if($test){ $runtime = 5 }
+          elseif($rtIn -gt 0){ $runtime = [Math]::Min($rtIn,355) }
+          else { $runtime = 355 }
 
-          if($doPurge){
+          # choose this instance's hostname (A dispatches B for others if needed)
+          $hostname = if($multi){ "$env:BASE_HOST1" } else { "$env:BASE_HOST" }
+
+          echo "multi=$multi"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "count=$count"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "runtime=$runtime"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "hostname=$hostname"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Runtime (minutes): $runtime"
+          Write-Host "Multi mode: $multi  count: $count"
+          Write-Host "Hostname (this job): $hostname"
+
+      - name: Setup hostname env
+        run: |
+          $hn = "${{ steps.host.outputs.hostname }}"
+          echo "TS_HOSTNAME=$hn" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "RUNTIME_MINUTES=${{ steps.host.outputs.runtime }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Purge bullet* devices (start)
+        if: ${{ inputs.purge_bullet == 'true' || inputs.purge_bullet == 'True' }}
+        env:
+          TAILNET:  ${{ inputs.ts_tailnet }}
+          APIKEY:   ${{ inputs.ts_api_key }}
+        run: |
+          $ErrorActionPreference="Continue"
+          function Purge(){
+            param($Tailnet,$ApiKey)
             try{
-              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-              $tn   = [uri]::EscapeDataString($tailnet)
-              $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-              $n=0
-              foreach($d in $list.devices){
-                if($d.hostname -like "$prefix*"){
-                  Write-Host "Purge start: $($d.hostname)"
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                  $n++
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ApiKey:"))
+              $hdr  = @{ Authorization = "Basic $auth"; Accept = "application/json" }
+              $url  = "https://api.tailscale.com/api/v2/tailnet/$Tailnet/devices"
+              $r    = Invoke-RestMethod -Method GET -Uri $url -Headers $hdr -UseBasicParsing
+              $me   = @{}
+              foreach($d in $r.devices){
+                if($d.hostname -match '^(?i)bullet(\d+)?$'){
+                  $me[$d.id]=$true
                 }
               }
-              Write-Host "Purged $n bullet* at start."
-            }catch{ Write-Warning "Start purge warning: $($_.Exception.Message)" }
+              foreach($id in $me.Keys){
+                try{
+                  $delUrl="https://api.tailscale.com/api/v2/device/$id"
+                  Invoke-RestMethod -Method DELETE -Uri $delUrl -Headers $hdr -UseBasicParsing | Out-Null
+                  Write-Host "Purged device $id"
+                }catch{ Write-Host "WARN purge $id: $($_.Exception.Message)" }
+              }
+            }catch{ Write-Host "WARN purge list: $($_.Exception.Message)" }
           }
+          Purge -Tailnet $env:TAILNET -ApiKey $env:APIKEY
 
-          # RDP user
+      - name: Setup Tailscale + RDP
+        env:
+          AUTHKEY: ${{ inputs.ts_authkey }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Ensure Tailscale
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          # Enable RDP account
           $u=$env:RDP_USER; $p=$env:RDP_PASS
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
@@ -132,139 +164,55 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # Tailscale install and up with fixed hostname
-          $exe = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
-            $dst = "$env:TEMP\tailscale-setup.exe"
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
-          }
-          Start-Service Tailscale -ErrorAction SilentlyContinue
+          # Tailscale up with the decided hostname
           & $exe logout | Out-Null
-          & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
-          Start-Sleep -Seconds 2
+          & $exe up --authkey "$env:AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+
           $ip4 = (& $exe ip -4 | Select-Object -First 1)
           $st  = & $exe status --json | ConvertFrom-Json
-          Write-Host "RDP login -> user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip4 dns=$($st.Self.DNSName)"
+          Write-Host "RDP login => user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip4"
+          Write-Host "dns=$($st.Self.DNSName)"
 
-      - name: Install RustDesk and launch (optional)
+      - name: Install RustDesk + launch (optional)
+        if: ${{ inputs.install_rustdesk }}
         run: |
-          $extras = "${{ inputs.extras }}"
-          if($extras -notmatch '(?i)rustdesk'){ Write-Host "RustDesk not requested."; exit 0 }
-          $ErrorActionPreference = "Stop"
-
+          $ErrorActionPreference="Continue"
+          # first try winget
           try {
             winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements
-          } catch {
-            Write-Warning "Winget failed: $($_.Exception.Message)"
-          }
-
-          $rd = Get-ChildItem "C:\Program Files\RustDesk\rustdesk.exe","C:\Program Files (x86)\RustDesk\rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          } catch { Write-Host "winget RustDesk failed: $($_.Exception.Message)" }
+          # fallback EXE
+          $rd = Get-ChildItem "C:\Program Files" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if(-not $rd){ $rd = Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 }
           if(-not $rd){
             try{
-              $u = "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.0-x86_64.exe"
-              $f = "$env:TEMP\rustdesk.exe"
-              Invoke-WebRequest $u -OutFile $f -UseBasicParsing
-              Start-Process $f -ArgumentList "/SILENT" -Wait
-              $rd = Get-ChildItem "C:\Program Files\RustDesk\rustdesk.exe","C:\Program Files (x86)\RustDesk\rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            }catch{
-              Write-Warning "RustDesk fallback failed: $($_.Exception.Message)"
-            }
+              $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
+              $dst="$env:TEMP\rustdesk.exe"
+              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+              Start-Process $dst -ArgumentList "/verysilent /norestart" -Wait
+            }catch{ Write-Host "RustDesk EXE fallback failed: $($_.Exception.Message)" }
           }
-          if($rd){ Start-Process $rd.FullName; Start-Sleep -Seconds 6; Write-Host "RustDesk launched." } else { Write-Warning "RustDesk not found." }
+          $rd = Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if($rd){ Start-Process $rd.FullName; Write-Host "RustDesk launched: $($rd.FullName)" } else { Write-Host "WARNING: RustDesk not found." }
 
-      - name: Chrome Remote Desktop (optional, one-line command)
+      - name: Chrome Remote Desktop (optional) — accept CODE only
+        if: ${{ inputs.crd_code != '' }}
         run: |
-          $cmd = "${{ inputs.crd_code }}".Trim()
-          if([string]::IsNullOrWhiteSpace($cmd)){ Write-Host "CRD not requested."; exit 0 }
-          Write-Host "Executing provided CRD command..."
-          try{
-            powershell -NoProfile -ExecutionPolicy Bypass -Command $cmd
-            Write-Host "CRD command executed."
-          }catch{
-            Write-Warning "CRD failed: $($_.Exception.Message)"
-          }
-
-      - name: Install Avica Lite (optional)
-        run: |
-          $extras = "${{ inputs.extras }}"
-          if($extras -notmatch '(?i)avica'){ Write-Host "Avica not requested."; exit 0 }
-          $url = "https://download.avica.com/AvicaLite_v8.0.8.9.exe"
-          $dst = "$env:TEMP\AvicaLite.exe"
-          try{
-            Invoke-WebRequest $url -OutFile $dst -UseBasicParsing
-            Start-Process $dst -ArgumentList "/SILENT" -Wait
-            Write-Host "Avica Lite installed."
-          }catch{
-            Write-Warning "Avica Lite install failed: $($_.Exception.Message)"
-          }
-
-      - name: Portable browsers (optional)
-        run: |
-          $extras = "${{ inputs.extras }}"
-          if($extras -notmatch '(?i)browsers'){ Write-Host "Portable browsers not requested."; exit 0 }
-
-          $root = "C:\PortableApps"
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-
-          function Fetch($url,$out){
-            try { Invoke-WebRequest $url -OutFile $out -UseBasicParsing; return (Test-Path $out) }
-            catch { Write-Warning "Download failed: $url -> $($_.Exception.Message)"; return $false }
-          }
-
-          # Firefox Developer Portable
-          $ffp = Join-Path $root "FirefoxDevPortable.paf.exe"
-          if(Fetch "https://portableapps.com/redirect/?a=FirefoxDeveloperEditionPortable&s=s&d=pa" $ffp){
-            Start-Process $ffp -WorkingDirectory $root -ArgumentList "/SILENT" -Wait
-            Write-Host "Firefox Developer Portable ready."
-          } else { Write-Warning "Firefox Developer Portable skipped." }
-
-          # Brave Portable
-          $bp = Join-Path $root "brave-portable-setup.exe"
-          if(Fetch "https://github.com/portapps/brave-portable/releases/latest/download/brave-portable-win64-setup.exe" $bp){
-            Start-Process $bp -WorkingDirectory $root -ArgumentList "/SILENT" -Wait
-            Write-Host "Brave Portable ready."
-          } else { Write-Warning "Brave Portable skipped." }
-
-          # Vivaldi Portable
-          $vp = Join-Path $root "vivaldi-portable-setup.exe"
-          if(Fetch "https://github.com/portapps/vivaldi-portable/releases/latest/download/vivaldi-portable-win64-setup.exe" $vp){
-            Start-Process $vp -WorkingDirectory $root -ArgumentList "/SILENT" -Wait
-            Write-Host "Vivaldi Portable ready."
-          } else { Write-Warning "Vivaldi Portable skipped." }
-
-          # Chromium Portable
-          $cp = Join-Path $root "chromium-portable-setup.exe"
-          $ok = $false
-          if(Fetch "https://github.com/portapps/chromium-portable/releases/latest/download/chromium-portable-win64-setup.exe" $cp){
-            Start-Process $cp -WorkingDirectory $root -ArgumentList "/SILENT" -Wait
-            $ok = $true
-            Write-Host "Chromium Portable ready."
+          $ErrorActionPreference="Continue"
+          $exe = "${Env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if(Test-Path $exe){
+            $code = "${{ inputs.crd_code }}"
+            $cmd = "& `"$exe`" --code=`"$code`" --redirect-url=`"https://remotedesktop.google.com/_/oauthredirect`" --name=$Env:COMPUTERNAME"
+            Write-Host "Running CRD host registration..."
+            Invoke-Expression $cmd
+            Write-Host "CRD command issued."
           } else {
-            $zip = Join-Path $root "chromium.zip"
-            if(Fetch "https://github.com/Hibbiki/chromium-win64/releases/latest/download/chromium-win64.zip" $zip){
-              Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $root "Chromium") -Force
-              Remove-Item $zip -Force
-              $ok = $true
-              Write-Host "Chromium Portable (zip) ready."
-            } else { Write-Warning "Chromium Portable skipped." }
+            Write-Host "⚠️ CRD host binary not found, skipping."
           }
-
-          # Opera Portable
-          $op = Join-Path $root "OperaPortable.paf.exe"
-          if(Fetch "https://portableapps.com/redirect/?a=OperaPortable&s=s&d=pa" $op){
-            Start-Process $op -WorkingDirectory $root -ArgumentList "/SILENT" -Wait
-            Write-Host "Opera Portable ready."
-          } else { Write-Warning "Opera Portable skipped." }
 
       - name: Keep alive
         run: |
-          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
-          $test = "${{ inputs.quick_test }}" -match '^(?i:true|1|yes|on)$'
-          $mins = IntOr("${{ inputs.runtime_minutes }}",355)
-          if($test){ $mins = 5 } elseif($mins -lt 6){ $mins = 355 }
-          if($mins -gt 360){ $mins = 355 }
+          $mins = [int]"$env:RUNTIME_MINUTES"
           $end=(Get-Date).AddMinutes($mins)
           while((Get-Date) -lt $end){
             $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
@@ -272,49 +220,55 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      - name: Purge bullet devices at end
+      - name: Purge bullet* devices (end)
+        if: ${{ inputs.purge_bullet == 'true' || inputs.purge_bullet == 'True' }}
+        env:
+          TAILNET:  ${{ inputs.ts_tailnet }}
+          APIKEY:   ${{ inputs.ts_api_key }}
         run: |
-          if("${{ inputs.do_purge }}" -notmatch '^(?i:true|1|yes|on)$'){ Write-Host "Skip end purge."; exit 0 }
-          try{
-            $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-            $tn   = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-            $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-            $prefix = "${env:BASE_PREFIX}"
-            $count = 0
-            foreach($d in $list.devices){
-              if($d.hostname -like "$prefix*"){
-                Write-Host "Purge end: $($d.hostname)"
-                Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                $count++
+          $ErrorActionPreference="Continue"
+          function Purge(){
+            param($Tailnet,$ApiKey)
+            try{
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$ApiKey:"))
+              $hdr  = @{ Authorization = "Basic $auth"; Accept = "application/json" }
+              $url  = "https://api.tailscale.com/api/v2/tailnet/$Tailnet/devices"
+              $r    = Invoke-RestMethod -Method GET -Uri $url -Headers $hdr -UseBasicParsing
+              foreach($d in $r.devices){
+                if($d.hostname -match '^(?i)bullet(\d+)?$'){
+                  try{
+                    Invoke-RestMethod -Method DELETE -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null
+                    Write-Host "Purged device $($d.id)"
+                  }catch{ Write-Host "WARN purge $($d.id): $($_.Exception.Message)" }
+                }
               }
-            }
-            Write-Host "Purged $count bullet* at end."
-          }catch{
-            Write-Warning "End purge warning: $($_.Exception.Message)"
+            }catch{ Write-Host "WARN purge list: $($_.Exception.Message)" }
           }
+          Purge -Tailnet $env:TAILNET -ApiKey $env:APIKEY
 
-      - name: Dispatch next or stop
-        if: always()
+      - name: Dispatch additional instances (B) if multi_rdp
+        if: ${{ steps.host.outputs.multi == 'True' && steps.host.outputs.count != '1' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $cycles = [int]"${{ inputs.cycles }}"
-          if($cycles -le 1){ Write-Host "No further cycles."; exit 0 }
-
-          $payload = @{
-            ts_tailnet      = "${{ inputs.ts_tailnet }}"
-            ts_api_key      = "${{ inputs.ts_api_key }}"
-            ts_authkey      = "${{ inputs.ts_authkey }}"
-            quick_test      = "${{ inputs.quick_test }}"
-            runtime_minutes = "${{ inputs.runtime_minutes }}"
-            do_purge        = "${{ inputs.do_purge }}"
-            rdp_count       = "${{ inputs.rdp_count }}"
-            cycles          = "$([int]$cycles - 1)"
-            crd_code        = "${{ inputs.crd_code }}"
-            extras          = "${{ inputs.extras }}"
+          $count=[int]"${{ steps.host.outputs.count }}"
+          if($count -le 1){ return }
+          for($i=2;$i -le $count;$i++){
+            $payload = @{
+              ts_tailnet      = "${{ inputs.ts_tailnet }}"
+              ts_api_key      = "${{ inputs.ts_api_key }}"
+              ts_authkey      = "${{ inputs.ts_authkey }}"
+              test_mode       = "${{ inputs.test_mode }}"
+              purge_bullet    = "${{ inputs.purge_bullet }}"
+              runtime_minutes = "${{ steps.host.outputs.runtime }}"
+              index           = "$i"
+              total           = "$count"
+              install_rustdesk= "${{ inputs.install_rustdesk }}"
+              crd_code        = "${{ inputs.crd_code }}"
+            }
+            $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+            $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+            $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
+            Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
+            Write-Host "Dispatched B($i/$count)"
           }
-          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
-          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-          $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
-          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
-          Write-Host "Dispatched Workflow B"
