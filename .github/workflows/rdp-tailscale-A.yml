@@ -144,16 +144,39 @@ jobs:
           Write-Host "Tailscale IPv4: $ip4"
 
       # -------- CRD: install (if needed) + run, WHEN crd_code provided (keep RustDesk/RDP ON) --------
-      - name: Install Chrome Remote Desktop Host (if missing)
+      - name: Install Chrome Remote Desktop Host (if missing)  # with EXE -> MSI fallback
         if: env.CRD_ENABLED == '1'
         run: |
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
-            Write-Host "CRD host not found, installing..."
-            $installer = "$env:TEMP\chromeremotedesktophost.exe"
-            Invoke-WebRequest -Uri "https://dl.google.com/support/remote_assistance/ChromotingHostSetup.exe" -OutFile $installer
-            Start-Process -FilePath $installer -ArgumentList "/silent","/install" -Wait
-            Remove-Item $installer -Force
+            Write-Host "CRD host not found, attempting install (EXE -> MSI fallback)..."
+
+            # Try EXE first
+            $exePath = "$env:TEMP\chromeremotedesktophost.exe"
+            $exeOk = $false
+            try {
+              Invoke-WebRequest -Uri "https://dl.google.com/support/remote_assistance/ChromotingHostSetup.exe" -OutFile $exePath -ErrorAction Stop
+              Start-Process -FilePath $exePath -ArgumentList "/silent","/install" -Wait
+              Remove-Item $exePath -Force
+              $exeOk = $true
+              Write-Host "CRD EXE installer completed."
+            } catch {
+              Write-Host "EXE installer failed or not found: $($_.Exception.Message)"
+            }
+
+            if (-not $exeOk) {
+              # Fallback to MSI from edgedl
+              $msiPath = "$env:TEMP\chromeremotedesktophost.msi"
+              try {
+                Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msiPath -ErrorAction Stop
+                Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart" -Wait
+                Remove-Item $msiPath -Force
+                Write-Host "CRD MSI installer completed."
+              } catch {
+                Write-Error "MSI fallback failed too: $($_.Exception.Message)"
+                exit 1
+              }
+            }
           } else {
             Write-Host "CRD host already installed."
           }
