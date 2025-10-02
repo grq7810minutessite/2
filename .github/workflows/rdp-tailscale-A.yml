@@ -24,7 +24,6 @@ on:
         description: "Install & launch RustDesk"
         type: boolean
         default: true
-      # CRD code is ONLY honored when multi_rdp=false
       crd_code:
         description: "Chrome Remote Desktop CODE (single-RDP only)"
         required: false
@@ -37,7 +36,6 @@ on:
         description: "Number of instances (1-10)"
         required: false
         default: "1"
-      # internal guard: children runs won't spawn more
       spawned:
         description: "INTERNAL: child run flag"
         required: false
@@ -53,12 +51,13 @@ concurrency:
 
 jobs:
   rdp:
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 370
     env:
       RDP_USER:    Bullettemporary
       RDP_PASS:    Bullet@12345
       TS_HOSTNAME: bullet
+
     steps:
       - name: Echo inputs
         run: |
@@ -155,13 +154,11 @@ jobs:
 
           if(Test-Path $dst){
             try{
-              # install with short overall wait; if it hangs, continue
               $p = Start-Process $dst -ArgumentList "/VERYSILENT","/NORESTART" -PassThru
               if(-not $p.WaitForExit(90000)){ Write-Host "Installer still running; proceeding…" }
             } catch { Write-Host "Installer warning: $($_.Exception.Message)" }
           }
 
-          # Find and launch quickly (don’t block the job)
           $rd = Get-ChildItem "C:\Program Files*" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if($rd){
             Write-Host "Launching RustDesk: $($rd.FullName)"
@@ -172,7 +169,7 @@ jobs:
           }
 
       - name: Chrome Remote Desktop (single-RDP only)
-        if: ${{ and(ne(steps.cfg.outputs.multi,'True'), inputs.crd_code != '') }}
+        if: ${{ steps.cfg.outputs.multi != 'True' && inputs.crd_code != '' }}
         shell: pwsh
         env:
           CODE: ${{ inputs.crd_code }}
@@ -185,9 +182,8 @@ jobs:
           Write-Host "CRD host started with provided CODE."
 
       - name: NOTE — CRD disabled in multi-RDP mode
-        if: ${{ and(eq(steps.cfg.outputs.multi,'True'), inputs.crd_code != '') }}
-        run: |
-          echo "Multi-RDP is ON, so CRD CODE is intentionally ignored for this run."
+        if: ${{ steps.cfg.outputs.multi == 'True' && inputs.crd_code != '' }}
+        run: echo "Multi-RDP is ON, so CRD CODE is intentionally ignored for this run."
 
       - name: Keep alive (~${{ steps.cfg.outputs.runtime }} min)
         shell: pwsh
@@ -215,29 +211,41 @@ jobs:
             foreach($d in $targets){ Write-Host "Deleting $($d.hostname)"; Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null; Start-Sleep -Milliseconds 200 }
           } catch { Write-Host "Purge warning (end): $($_.Exception.Message)" }
 
-      - name: Dispatch additional instances (children)
-        if: ${{ and(eq(steps.cfg.outputs.multi,'True'), eq(steps.cfg.outputs.spawned,'False')) }}
-        uses: peter-evans/workflow-dispatch@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          workflow: rdp-tailscale-A.yml
-          ref: ${{ github.ref }}
-          inputs: |
-            {
-              "ts_tailnet": "${{ inputs.ts_tailnet }}",
-              "ts_api_key": "${{ inputs.ts_api_key }}",
-              "ts_authkey": "${{ inputs.ts_authkey }}",
-              "test_mode": "${{ inputs.test_mode }}",
-              "purge_bullet": "false",
-              "install_rustdesk": "${{ inputs.install_rustdesk }}",
-              "crd_code": "",
-              "multi_rdp": "false",
-              "rdp_count": "1",
-              "spawned": "true"
-            }
-        continue-with: ${{ steps.cfg.outputs.count != '1' }}
+      - name: Dispatch N-1 child runs (only once from parent)
+        if: ${{ steps.cfg.outputs.multi == 'True' && steps.cfg.outputs.spawned == 'False' && steps.cfg.outputs.count != '1' }}
+        shell: pwsh
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO:  ${{ github.event.repository.name }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF:   ${{ github.ref }}
+          COUNT: ${{ steps.cfg.outputs.count }}
+        run: |
+          $headers = @{ Authorization = "Bearer $env:TOKEN"; Accept = "application/vnd.github+json" }
+          $repo = "$env:OWNER/$env:REPO"
+          $url = "https://api.github.com/repos/$repo/actions/workflows/rdp-tailscale-A.yml/dispatches"
+          $n = [int]$env:COUNT
+          for($i=2; $i -le $n; $i++){
+            $body = @{
+              ref = "$env:REF"
+              inputs = @{
+                ts_tailnet      = "${{ inputs.ts_tailnet }}"
+                ts_api_key      = "${{ inputs.ts_api_key }}"
+                ts_authkey      = "${{ inputs.ts_authkey }}"
+                test_mode       = "${{ inputs.test_mode }}"
+                purge_bullet    = "false"
+                install_rustdesk= "${{ inputs.install_rustdesk }}"
+                crd_code        = ""
+                multi_rdp       = "false"
+                rdp_count       = "1"
+                spawned         = "true"
+              }
+            } | ConvertTo-Json -Depth 4
+            Write-Host "Dispatching child #$i"
+            Invoke-RestMethod -Method POST -Uri $url -Headers $headers -Body $body
+            Start-Sleep -Milliseconds 300
+          }
+          Write-Host "Done dispatching $($n-1) child run(s)."
 
       - name: Summary
-        run: |
-          echo "Run complete. If multi-RDP was enabled, child runs were dispatched (up to the safe cap of 10)."
+        run: echo "Run complete."
