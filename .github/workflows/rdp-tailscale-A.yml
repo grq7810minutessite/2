@@ -34,9 +34,9 @@ on:
         default: "1"
       crd_code:
         description: >-
-          Paste raw CRD code (4/0AV...), OR full remoting_start_host.exe command,
-          OR text/URL containing --code="4/...". If provided -> forces single instance and
-          launches CRD first (then RustDesk/RDP continues).
+          Paste raw CRD code (4/0AV...), or the full PowerShell command line,
+          or a string/URL containing --code="4/...". If provided -> forces single instance
+          and launches CRD first (then RustDesk/RDP continues).
         required: false
         default: ""
 
@@ -56,7 +56,11 @@ jobs:
     steps:
       - id: mk
         run: |
-          $crd = "${{ inputs.crd_code }}".Trim()
+          # Read crd_code safely (literal) to avoid parsing issues on Linux pwsh
+          $crd = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
+
           # If CRD provided, force single instance (disable multi)
           if ($crd.Length -gt 0) {
             $n = 1
@@ -72,7 +76,7 @@ jobs:
 
   rdp:
     needs: setup
-    runs-on: windows-latest   # change to windows-2025 if available in your org
+    runs-on: windows-latest
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
@@ -82,10 +86,12 @@ jobs:
       RDP_PASS: Bullet@12345
 
     steps:
-      # --- CRD FAST PATH (launch first to beat code timeout) ---
-      - name: Set CRD flag early
+      # --- CRD FIRST: avoid code expiry ---
+      - name: Set CRD flag early (safe read)
         run: |
-          $crd = "${{ inputs.crd_code }}".Trim()
+          $crd = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
           if ($crd.Length -gt 0) { "CRD_ENABLED=1" | Out-File -Append $env:GITHUB_ENV } else { "CRD_ENABLED=0" | Out-File -Append $env:GITHUB_ENV }
           Write-Host "CRD_ENABLED=$([int]($crd.Length -gt 0))"
 
@@ -95,8 +101,6 @@ jobs:
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
             Write-Host "CRD host not found, attempting install (EXE -> MSI fallback)..."
-
-            # Try EXE first
             $exePath = "$env:TEMP\chromeremotedesktophost.exe"
             $exeOk = $false
             try {
@@ -108,13 +112,11 @@ jobs:
             } catch {
               Write-Host "EXE installer failed or not found: $($_.Exception.Message)"
             }
-
             if (-not $exeOk) {
-              # Fallback to MSI from edgedl
               $msiPath = "$env:TEMP\chromeremotedesktophost.msi"
               try {
                 Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msiPath -ErrorAction Stop
-                Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart" -Wait
+                Start-Process msiexec.exe -ArgumentList "/i","`"$msiPath`"","/quiet","/norestart" -Wait
                 Remove-Item $msiPath -Force
                 Write-Host "CRD MSI installer completed."
               } catch {
@@ -129,18 +131,17 @@ jobs:
       - name: Run Chrome Remote Desktop (accept raw code / full cmd / url)
         if: env.CRD_ENABLED == '1'
         run: |
-          $raw = "${{ inputs.crd_code }}".Trim()
+          # Safe literal read (prevents parser errors with &, quotes, ${Env:...})
+          $raw = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
 
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "remoting_start_host.exe not found after install attempt."
-            exit 1
-          }
+          if (-not (Test-Path $exe)) { Write-Error "remoting_start_host.exe not found after install attempt."; exit 1 }
 
-          # Normalize: support raw code, full command, or a pasted string/URL containing --code="4/..."
+          # Normalize: raw code, full command, or string/URL containing --code="4/..."
           $code = $null
           $isFull = $false
-
           if ($raw -match 'remoting_start_host\.exe') {
             $isFull = $true
           } elseif ($raw -match '--code\s*=\s*"?4\/[A-Za-z0-9_\-]+' ) {
@@ -151,24 +152,21 @@ jobs:
           }
 
           if ($isFull) {
-            # Run the full command exactly as provided, via temp PS1 to avoid quoting issues
             $tmp = "$env:TEMP\crd_full.ps1"
             Set-Content -Path $tmp -Value $raw -Encoding UTF8
             powershell -ExecutionPolicy Bypass -File $tmp
           } else {
-            if (-not $code) { Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or a string containing --code=\"4/...\""; exit 1 }
+            if (-not $code) { Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or string containing --code=\"4/...\""; exit 1 }
             $redir = "https://remotedesktop.google.com/_/oauthredirect"
             $name  = $Env:COMPUTERNAME
             $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""")
             Start-Process -FilePath $exe -ArgumentList $args
           }
-
           Write-Host "CRD launch step completed."
 
       - name: Verify CRD registration (service + recent logs)
         if: env.CRD_ENABLED == '1'
         run: |
-          # Wait briefly for host registration
           $svcName = "Chrome Remote Desktop Service"
           $deadline = (Get-Date).AddSeconds(60)
           $ok = $false
@@ -177,14 +175,8 @@ jobs:
             if ($svc -and $svc.Status -in 'Running','StartPending') { $ok = $true; break }
             Start-Sleep -Seconds 3
           }
+          if ($ok) { Write-Host "[$svcName] status: Running or starting." } else { Write-Warning "[$svcName] not running yet." }
 
-          if ($ok) {
-            Write-Host "[$svcName] status: Running or starting."
-          } else {
-            Write-Warning "[$svcName] not running yet."
-          }
-
-          # Print recent CRD logs (best-effort)
           $logDir = "$env:ProgramData\Google\Chrome Remote Desktop"
           if (Test-Path $logDir) {
             Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
@@ -195,18 +187,11 @@ jobs:
             Write-Host "CRD log directory not found: $logDir"
           }
 
-          Write-Host "If the host doesn't appear in https://remotedesktop.google.com/access:"
-          Write-Host " - Ensure the code hasn't expired and matches your Google account session."
-          Write-Host " - Check org/policy blocks."
-          Write-Host " - Inspect logs above for auth/policy errors."
-
-      # --- Rest of the flow (after CRD is launched) ---
+      # --- continue with the rest after CRD is launched ---
       - name: Decide hostname + runtime
         run: |
           if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" } else { $hn = "bullet" }
           "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Hostname: $hn"
-
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
           $runtime = IntOr("${{ inputs.runtime_minutes }}",355)
@@ -214,7 +199,7 @@ jobs:
           if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
           if ($runtime -gt 360) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Runtime minutes: $runtime"
+          Write-Host "Hostname: $hn  | Runtime: $runtime"
 
       - name: Purge bullet* devices (optional)
         run: |
@@ -224,16 +209,10 @@ jobs:
               $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
               $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
               $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-              foreach($d in $list.devices){
-                if ($d.hostname -match '^bullet[0-9]*$'){
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                }
-              }
+              foreach($d in $list.devices){ if ($d.hostname -match '^bullet[0-9]*$'){ Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -EA SilentlyContinue } }
               Write-Host "Purged bullet* devices (if any)."
             } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
-          } else {
-            Write-Host "Purge disabled."
-          }
+          } else { Write-Host "Purge disabled." }
 
       - name: Install + Up Tailscale
         run: |
@@ -242,7 +221,7 @@ jobs:
             $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
             $dst = "$env:TEMP\tailscale.msi"
             Invoke-WebRequest -Uri $url -OutFile $dst
-            Start-Process msiexec.exe -ArgumentList "/i", "`"$dst`"", "/quiet", "/norestart" -Wait
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
             Remove-Item $dst -Force
           }
           & $ts logout | Out-Null
@@ -283,7 +262,7 @@ jobs:
               $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.msi"
               $installerPath = "$env:TEMP\rustdesk.msi"
               Invoke-WebRequest -Uri $rdUrl -OutFile $installerPath
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
               Remove-Item $installerPath -Force
             } catch {
               Write-Host "MSI install failed, trying winget…"
@@ -309,7 +288,6 @@ jobs:
           $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
           Start-Process -FilePath $rdExe -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
-
           $screenshotPath = "$env:TEMP\rustdesk_${{ matrix.id }}.png"
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
@@ -318,27 +296,18 @@ jobs:
           $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
           $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
           $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
-          $graphics.Dispose()
-          $bitmap.Dispose()
-
+          $graphics.Dispose(); $bitmap.Dispose()
           $curlResult = curl -F "file=@$screenshotPath" https://store1.gofile.io/uploadFile
           $json = $curlResult | ConvertFrom-Json
-          if ($json.status -eq "ok") {
-            $url = $json.data.downloadPage
-            Write-Host "RustDesk screenshot uploaded: $url"
-            "SCREENSHOT_URL=$url" | Out-File -Append $env:GITHUB_ENV
-          } else {
-            Write-Host "Screenshot upload failed."
-          }
+          if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
 
       - name: Keep alive (to ${{ env.RUNTIME_MINUTES }} mins)
         run: |
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
           while ((Get-Date) -lt $end) {
-            $crd = "$env:CRD_ENABLED"
-            $msg = if ($crd -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
-            Write-Host ("$msg Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
+            $mode = if ("$env:CRD_ENABLED" -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
+            Write-Host ("$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
             Start-Sleep -Seconds 60
           }
 
@@ -375,6 +344,4 @@ jobs:
               Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
               Write-Host "Dispatched Workflow B with cycles=$next"
             }
-          } else {
-            Write-Host "No cycles configured. Done."
-          }
+          } else { Write-Host "No cycles configured. Done." }
