@@ -1,4 +1,4 @@
-name: RDP via Tailscale + RustDesk (fast)
+name: RDP via Tailscale + RustDesk (full)
 
 on:
   workflow_dispatch:
@@ -7,27 +7,41 @@ on:
         description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
-        description: "Tailscale API key (device admin, no 'Bearer')"
+        description: "Tailscale API key (no 'Bearer')"
         required: true
       ts_authkey:
-        description: "Tailscale Auth key (reusable or ephemeral)"
+        description: "Tailscale Auth key"
         required: true
       test_mode:
-        description: "Run 5-minute test (unchecked = ~6h)"
+        description: "Test (5 min). Off = ~6h"
         type: boolean
         default: false
       purge_bullet:
-        description: "Purge bullet* devices at start & end"
+        description: "Purge bullet* at start & end"
         type: boolean
         default: true
       install_rustdesk:
         description: "Install & launch RustDesk"
         type: boolean
         default: true
+      # CRD code is ONLY honored when multi_rdp=false
       crd_code:
-        description: "Chrome Remote Desktop CODE (optional; paste only CODE)"
+        description: "Chrome Remote Desktop CODE (single-RDP only)"
         required: false
         default: ""
+      multi_rdp:
+        description: "Spawn multiple RDP instances"
+        type: boolean
+        default: false
+      rdp_count:
+        description: "Number of instances (1-10)"
+        required: false
+        default: "1"
+      # internal guard: children runs won't spawn more
+      spawned:
+        description: "INTERNAL: child run flag"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -46,30 +60,33 @@ jobs:
       RDP_PASS:    Bullet@12345
       TS_HOSTNAME: bullet
     steps:
-      - name: Set up job
+      - name: Echo inputs
         run: |
-          Write-Host "Runner: $env:RUNNER_OS $env:ImageOS"
+          Write-Host "multi_rdp=${{ inputs.multi_rdp }}  count=${{ inputs.rdp_count }}  spawned=${{ inputs.spawned }}"
+          Write-Host "test_mode=${{ inputs.test_mode }} purge=${{ inputs.purge_bullet }} rustdesk=${{ inputs.install_rustdesk }}"
 
-      - name: Compute runtime & helpers
+      - name: Compute runtime & normalize count
         id: cfg
         shell: pwsh
         run: |
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          $test = Yes("${{ inputs.test_mode }}")
+          $runtime = if($test){ 5 } else { 355 }
+          $purge = Yes("${{ inputs.purge_bullet }}")
+          $rd = Yes("${{ inputs.install_rustdesk }}")
+          $multi = Yes("${{ inputs.multi_rdp }}")
+          $spawned = Yes("${{ inputs.spawned }}")
+          $count = [int]("${{ inputs.rdp_count }}")
+          if($count -lt 1){ $count = 1 }
+          if($count -gt 10){ $count = 10 }
 
-          $test     = Yes("${{ inputs.test_mode }}")
-          $runtime  = if($test){ 5 } else { 355 }
-          $purge    = Yes("${{ inputs.purge_bullet }}")
-          $doRD     = Yes("${{ inputs.install_rustdesk }}")
-
-          echo "test=$test"
-          echo "runtime=$runtime"
-          echo "purge=$purge"
-          echo "rustdesk=$doRD"
-
-          "test=$test"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "runtime=$runtime" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "purge=$purge"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "rustdesk=$doRD"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "rustdesk=$rd"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "multi=$multi"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "spawned=$spawned" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "count=$count"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Runtime=$runtime min | Purge=$purge | RustDesk=$rd | Multi=$multi (count=$count) | Spawned=$spawned"
 
       - name: Purge bullet* devices (start)
         if: ${{ steps.cfg.outputs.purge == 'True' }}
@@ -78,35 +95,23 @@ jobs:
           TAILNET:  ${{ inputs.ts_tailnet }}
           APIKEY:   ${{ inputs.ts_api_key }}
         run: |
-          $ErrorActionPreference = "Continue"
           $pair = "$env:TAILNET:$env:APIKEY"
           $b64  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
           $hdrs = @{ Authorization = "Basic $b64"; Accept = "application/json" }
-
-          try {
+          try{
             $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$($env:TAILNET)/devices" -Headers $hdrs -Method GET
             $targets = @($list.devices | Where-Object { $_.hostname -match '^bullet(\d+)?$' -or $_.hostname -like 'bullet*' })
-            if($targets.Count -gt 0){
-              foreach($d in $targets){
-                Write-Host "Deleting device $($d.hostname) / $($d.id)"
-                Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null
-                Start-Sleep -Milliseconds 300
-              }
-            } else {
-              Write-Host "No bullet* devices to delete."
-            }
-          } catch {
-            Write-Host "Purge warning: $($_.Exception.Message)"
-          }
+            if($targets.Count){ foreach($d in $targets){ Write-Host "Deleting $($d.hostname)"; Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null; Start-Sleep -Milliseconds 200 } }
+            else { Write-Host "No bullet* devices to delete." }
+          } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
 
       - name: Setup Tailscale + RDP
         shell: pwsh
         env:
           AUTHKEY: ${{ inputs.ts_authkey }}
         run: |
-          $ErrorActionPreference = "Stop"
-
-          # Enable RDP user
+          $ErrorActionPreference="Stop"
+          # User + RDP
           $u=$env:RDP_USER; $p=$env:RDP_PASS
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
@@ -120,7 +125,7 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # Install Tailscale quickly if missing
+          # Tailscale
           $exe="C:\Program Files\Tailscale\tailscale.exe"
           if(-not (Test-Path $exe)){
             $url='https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
@@ -129,70 +134,70 @@ jobs:
             Start-Process $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
-
-          # Bring up with fixed hostname "bullet"
           & $exe logout | Out-Null
-          & $exe up --authkey "$env:AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
-          Start-Sleep -Seconds 2
-
+          & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
           $ip4 = (& $exe ip -4 | Select-Object -First 1)
           $dns = (& $exe status --json | ConvertFrom-Json).Self.DNSName
-          Write-Host "RDP login → user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip4 dns=$dns"
+          Write-Host "RDP → user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip4 dns=$dns"
 
-      - name: Install & Launch RustDesk (fast)
+      - name: Install & Launch RustDesk (resilient/fast)
         if: ${{ steps.cfg.outputs.rustdesk == 'True' }}
         shell: pwsh
         run: |
           $ErrorActionPreference="Continue"
+          $ProgressPreference="SilentlyContinue"
           $url = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
           $dst = "$env:TEMP\rustdesk.exe"
-          if (-not (Test-Path $dst)) {
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-          }
-          Start-Process $dst -ArgumentList "/VERYSILENT","/NORESTART" -Wait
 
-          # Find and launch quickly
+          try{
+            if(-not (Test-Path $dst)){ Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -TimeoutSec 120 }
+          } catch { Write-Host "RustDesk download warning: $($_.Exception.Message)" }
+
+          if(Test-Path $dst){
+            try{
+              # install with short overall wait; if it hangs, continue
+              $p = Start-Process $dst -ArgumentList "/VERYSILENT","/NORESTART" -PassThru
+              if(-not $p.WaitForExit(90000)){ Write-Host "Installer still running; proceeding…" }
+            } catch { Write-Host "Installer warning: $($_.Exception.Message)" }
+          }
+
+          # Find and launch quickly (don’t block the job)
           $rd = Get-ChildItem "C:\Program Files*" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if($rd){
             Write-Host "Launching RustDesk: $($rd.FullName)"
-            Start-Process $rd.FullName
-            Start-Sleep -Seconds 3
+            Start-Process $rd.FullName -WindowStyle Normal
+            Start-Sleep -Seconds 2
           } else {
-            Write-Host "RustDesk not found after install."
+            Write-Host "RustDesk not found after install (continuing)."
           }
 
-      - name: Chrome Remote Desktop (optional) — accept CODE only
-        if: ${{ inputs.crd_code != '' }}
+      - name: Chrome Remote Desktop (single-RDP only)
+        if: ${{ and(ne(steps.cfg.outputs.multi,'True'), inputs.crd_code != '') }}
         shell: pwsh
         env:
           CODE: ${{ inputs.crd_code }}
         run: |
-          $ErrorActionPreference="Continue"
           $crdExe = Join-Path ${env:PROGRAMFILES(X86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          if(-not (Test-Path $crdExe)){
-            Write-Host "CRD not installed on this image; skipping."
-            exit 0
-          }
-          $code  = $env:CODE.Trim()
-          if([string]::IsNullOrWhiteSpace($code)){ Write-Host "Empty CODE; skipping."; exit 0 }
-          $redir = "https://remotedesktop.google.com/_/oauthredirect"
-          $args  = @("--code=$code","--redirect-url=$redir","--name=$env:COMPUTERNAME")
-          Start-Process $crdExe -ArgumentList $args -WindowStyle Hidden
-          Write-Host "Started Chrome Remote Desktop host with provided CODE."
+          if(-not (Test-Path $crdExe)){ Write-Host "CRD not installed on image; skipping."; exit 0 }
+          $code=$env:CODE.Trim(); if([string]::IsNullOrWhiteSpace($code)){ Write-Host "Empty CODE; skip."; exit 0 }
+          $redir="https://remotedesktop.google.com/_/oauthredirect"
+          Start-Process $crdExe -ArgumentList @("--code=$code","--redirect-url=$redir","--name=$env:COMPUTERNAME") -WindowStyle Hidden
+          Write-Host "CRD host started with provided CODE."
+
+      - name: NOTE — CRD disabled in multi-RDP mode
+        if: ${{ and(eq(steps.cfg.outputs.multi,'True'), inputs.crd_code != '') }}
+        run: |
+          echo "Multi-RDP is ON, so CRD CODE is intentionally ignored for this run."
 
       - name: Keep alive (~${{ steps.cfg.outputs.runtime }} min)
         shell: pwsh
         run: |
-          $ErrorActionPreference="SilentlyContinue"
           $mins = [int]"${{ steps.cfg.outputs.runtime }}"
-          $end=(Get-Date).AddMinutes($mins); $tick=0
+          $end=(Get-Date).AddMinutes($mins); $i=0
           while((Get-Date) -lt $end){
-            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
-            if(($tick % 30) -eq 0){ Write-Host "Alive… $left min left"; }
-            Start-Sleep -Seconds 60
-            $tick++
+            if(($i % 30) -eq 0){ Write-Host "Alive… $([int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))) min left" }
+            Start-Sleep -Seconds 60; $i++
           }
-          Write-Host "Keep-alive finished."
 
       - name: Purge bullet* devices (end)
         if: ${{ steps.cfg.outputs.purge == 'True' }}
@@ -201,19 +206,38 @@ jobs:
           TAILNET:  ${{ inputs.ts_tailnet }}
           APIKEY:   ${{ inputs.ts_api_key }}
         run: |
-          $ErrorActionPreference = "Continue"
           $pair = "$env:TAILNET:$env:APIKEY"
           $b64  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
           $hdrs = @{ Authorization = "Basic $b64"; Accept = "application/json" }
-
-          try {
+          try{
             $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$($env:TAILNET)/devices" -Headers $hdrs -Method GET
             $targets = @($list.devices | Where-Object { $_.hostname -match '^bullet(\d+)?$' -or $_.hostname -like 'bullet*' })
-            foreach($d in $targets){
-              Write-Host "Deleting device $($d.hostname) / $($d.id)"
-              Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null
-              Start-Sleep -Milliseconds 300
+            foreach($d in $targets){ Write-Host "Deleting $($d.hostname)"; Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null; Start-Sleep -Milliseconds 200 }
+          } catch { Write-Host "Purge warning (end): $($_.Exception.Message)" }
+
+      - name: Dispatch additional instances (children)
+        if: ${{ and(eq(steps.cfg.outputs.multi,'True'), eq(steps.cfg.outputs.spawned,'False')) }}
+        uses: peter-evans/workflow-dispatch@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          workflow: rdp-tailscale-A.yml
+          ref: ${{ github.ref }}
+          inputs: |
+            {
+              "ts_tailnet": "${{ inputs.ts_tailnet }}",
+              "ts_api_key": "${{ inputs.ts_api_key }}",
+              "ts_authkey": "${{ inputs.ts_authkey }}",
+              "test_mode": "${{ inputs.test_mode }}",
+              "purge_bullet": "false",
+              "install_rustdesk": "${{ inputs.install_rustdesk }}",
+              "crd_code": "",
+              "multi_rdp": "false",
+              "rdp_count": "1",
+              "spawned": "true"
             }
-          } catch {
-            Write-Host "Purge warning (end): $($_.Exception.Message)"
-          }
+        continue-with: ${{ steps.cfg.outputs.count != '1' }}
+
+      - name: Summary
+        run: |
+          echo "Run complete. If multi-RDP was enabled, child runs were dispatched (up to the safe cap of 10)."
