@@ -1,4 +1,4 @@
-name: RDP via Tailscale + (optional) CRD (Workflow A)
+name: RDP via Tailscale + RustDesk (fast)
 
 on:
   workflow_dispatch:
@@ -7,35 +7,27 @@ on:
         description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
-        description: "Tailscale API key (device admin) — no 'Bearer'"
+        description: "Tailscale API key (device admin, no 'Bearer')"
         required: true
       ts_authkey:
         description: "Tailscale Auth key (reusable or ephemeral)"
         required: true
       test_mode:
-        description: "Run 5-minute test"
+        description: "Run 5-minute test (unchecked = ~6h)"
         type: boolean
         default: false
-      runtime_minutes:
-        description: "Runtime (max 355). Ignored if test_mode=true."
-        default: "355"
-        required: false
       purge_bullet:
-        description: "Purge bullet* devices at start/end"
-        default: "true"
-        required: false
-      hostname_suffix:
-        description: "(optional) numeric suffix, e.g. 3 -> bullet3; blank -> bullet"
-        default: ""
-        required: false
-      crd_code:
-        description: "(optional) CRD CODE only (e.g. 4/0AVGz...), leave blank to skip"
-        default: ""
-        required: false
+        description: "Purge bullet* devices at start & end"
+        type: boolean
+        default: true
       install_rustdesk:
         description: "Install & launch RustDesk"
         type: boolean
         default: true
+      crd_code:
+        description: "Chrome Remote Desktop CODE (optional; paste only CODE)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -45,10 +37,6 @@ concurrency:
   group: tailscale-rdp-singleton
   cancel-in-progress: false
 
-defaults:
-  run:
-    shell: pwsh
-
 jobs:
   rdp:
     runs-on: windows-2025
@@ -56,70 +44,69 @@ jobs:
     env:
       RDP_USER:    Bullettemporary
       RDP_PASS:    Bullet@12345
-      X_DIR:       C:\Users\Public\Transfer
-
+      TS_HOSTNAME: bullet
     steps:
       - name: Set up job
         run: |
           Write-Host "Runner: $env:RUNNER_OS $env:ImageOS"
 
-      - name: Compute hostname
-        id: host
+      - name: Compute runtime & helpers
+        id: cfg
+        shell: pwsh
         run: |
-          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
-          $suf = "${{ inputs.hostname_suffix }}".Trim()
-          if($suf -match '^\d+$' -and [int]$suf -gt 0){
-            $hn = "bullet$suf"
-          } else {
-            $hn = "bullet"
-          }
-          "name=$hn" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Hostname (this job): $hn"
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+
+          $test     = Yes("${{ inputs.test_mode }}")
+          $runtime  = if($test){ 5 } else { 355 }
+          $purge    = Yes("${{ inputs.purge_bullet }}")
+          $doRD     = Yes("${{ inputs.install_rustdesk }}")
+
+          echo "test=$test"
+          echo "runtime=$runtime"
+          echo "purge=$purge"
+          echo "rustdesk=$doRD"
+
+          "test=$test"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "runtime=$runtime" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "purge=$purge"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "rustdesk=$doRD"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Purge bullet* devices (start)
-        if: ${{ inputs.purge_bullet == 'true' || inputs.purge_bullet == 'True' }}
+        if: ${{ steps.cfg.outputs.purge == 'True' }}
+        shell: pwsh
         env:
           TAILNET:  ${{ inputs.ts_tailnet }}
           APIKEY:   ${{ inputs.ts_api_key }}
         run: |
-          $ErrorActionPreference="Continue"
-          function Purge(){
-            param($Tailnet,$ApiKey)
-            try{
-              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($ApiKey):"))
-              $hdr  = @{ Authorization = "Basic $auth"; Accept = "application/json" }
-              $url  = "https://api.tailscale.com/api/v2/tailnet/$Tailnet/devices"
-              $r    = Invoke-RestMethod -Method GET -Uri $url -Headers $hdr -UseBasicParsing
-              foreach($d in $r.devices){
-                if($d.hostname -match '^(?i)bullet(\d+)?$'){
-                  try{
-                    Invoke-RestMethod -Method DELETE -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null
-                    Write-Host "Purged device $($d.hostname) ($($d.id))"
-                  }catch{ Write-Host "WARN purge $($d.hostname): $($_.Exception.Message)" }
-                }
+          $ErrorActionPreference = "Continue"
+          $pair = "$env:TAILNET:$env:APIKEY"
+          $b64  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $hdrs = @{ Authorization = "Basic $b64"; Accept = "application/json" }
+
+          try {
+            $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$($env:TAILNET)/devices" -Headers $hdrs -Method GET
+            $targets = @($list.devices | Where-Object { $_.hostname -match '^bullet(\d+)?$' -or $_.hostname -like 'bullet*' })
+            if($targets.Count -gt 0){
+              foreach($d in $targets){
+                Write-Host "Deleting device $($d.hostname) / $($d.id)"
+                Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null
+                Start-Sleep -Milliseconds 300
               }
-            }catch{ Write-Host "WARN purge list: $($_.Exception.Message)" }
+            } else {
+              Write-Host "No bullet* devices to delete."
+            }
+          } catch {
+            Write-Host "Purge warning: $($_.Exception.Message)"
           }
-          Purge -Tailnet $env:TAILNET -ApiKey $env:APIKEY
 
       - name: Setup Tailscale + RDP
+        shell: pwsh
         env:
-          TS_HOSTNAME: ${{ steps.host.outputs.name }}
-          AUTHKEY:     ${{ inputs.ts_authkey }}
+          AUTHKEY: ${{ inputs.ts_authkey }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          # --- Install Tailscale if missing ---
-          $exe = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
-            $dst = "$env:TEMP\tailscale-setup.exe"
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
-          }
-          Start-Service Tailscale -ErrorAction SilentlyContinue
-
-          # --- Enable RDP user ---
+          # Enable RDP user
           $u=$env:RDP_USER; $p=$env:RDP_PASS
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
@@ -133,117 +120,100 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # --- Tailscale up (fixed hostname) ---
+          # Install Tailscale quickly if missing
+          $exe="C:\Program Files\Tailscale\tailscale.exe"
+          if(-not (Test-Path $exe)){
+            $url='https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst="$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          # Bring up with fixed hostname "bullet"
           & $exe logout | Out-Null
           & $exe up --authkey "$env:AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
           Start-Sleep -Seconds 2
 
           $ip4 = (& $exe ip -4 | Select-Object -First 1)
-          $st  = & $exe status --json | ConvertFrom-Json
-          Write-Host ("RDP login → user=$env:RDP_USER pass=$env:RDP_PASS ip={0}`ndns={1}" -f $ip4, $st.Self.DNSName)
+          $dns = (& $exe status --json | ConvertFrom-Json).Self.DNSName
+          Write-Host "RDP login → user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip4 dns=$dns"
 
-      - name: Install RustDesk + launch (optional)
-        if: ${{ inputs.install_rustdesk }}
+      - name: Install & Launch RustDesk (fast)
+        if: ${{ steps.cfg.outputs.rustdesk == 'True' }}
+        shell: pwsh
         run: |
           $ErrorActionPreference="Continue"
-
-          # Try winget first
-          try {
-            winget install --id RustDesk.RustDesk -e --accept-source-agreements --accept-package-agreements --silent
-          } catch { Write-Host "winget RustDesk install warning: $($_.Exception.Message)" }
-
-          # Fallback direct EXE (no MSI/html traps)
-          $exeUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
-          $exeDst = "$env:TEMP\rustdesk.exe"
-          if (-not (Get-Command rustdesk.exe -ErrorAction SilentlyContinue)) {
-            try {
-              Invoke-WebRequest -Uri $exeUrl -OutFile $exeDst -UseBasicParsing
-              Start-Process -FilePath $exeDst -ArgumentList "/SILENT" -Wait
-            } catch { Write-Host "RustDesk EXE fallback warning: $($_.Exception.Message)" }
+          $url = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
+          $dst = "$env:TEMP\rustdesk.exe"
+          if (-not (Test-Path $dst)) {
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
           }
+          Start-Process $dst -ArgumentList "/VERYSILENT","/NORESTART" -Wait
 
-          # Launch visible if found
-          $rd = $null
-          $rd = Get-ChildItem "C:\Program Files" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if(-not $rd){ $rd = Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          # Find and launch quickly
+          $rd = Get-ChildItem "C:\Program Files*" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if($rd){
             Write-Host "Launching RustDesk: $($rd.FullName)"
             Start-Process $rd.FullName
-            Start-Sleep -Seconds 8
+            Start-Sleep -Seconds 3
           } else {
-            Write-Host "WARNING: RustDesk not found after install."
+            Write-Host "RustDesk not found after install."
           }
 
       - name: Chrome Remote Desktop (optional) — accept CODE only
         if: ${{ inputs.crd_code != '' }}
+        shell: pwsh
         env:
-          CRD_CODE: ${{ inputs.crd_code }}
+          CODE: ${{ inputs.crd_code }}
         run: |
           $ErrorActionPreference="Continue"
-
-          # Ensure Chrome Remote Desktop host is present (winget)
-          try {
-            winget install --id Google.ChromeRemoteDesktop -e --accept-source-agreements --accept-package-agreements --silent
-          } catch { Write-Host "winget CRD install warning: $($_.Exception.Message)" }
-
-          $code = ($env:CRD_CODE).Trim()
-          if($code -notmatch '^4/'){ Write-Host "Provided value does not look like a CRD CODE (must start with 4/). Skipping."; exit 0 }
-
-          $crdPath = Join-Path ${env:PROGRAMFILES(X86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          if(-not (Test-Path $crdPath)){
-            Write-Host "CRD host binary not found: $crdPath"
+          $crdExe = Join-Path ${env:PROGRAMFILES(X86)} "Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if(-not (Test-Path $crdExe)){
+            Write-Host "CRD not installed on this image; skipping."
             exit 0
           }
-
+          $code  = $env:CODE.Trim()
+          if([string]::IsNullOrWhiteSpace($code)){ Write-Host "Empty CODE; skipping."; exit 0 }
           $redir = "https://remotedesktop.google.com/_/oauthredirect"
-          $name  = $env:COMPUTERNAME
-          $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""")
-          Write-Host "Starting CRD host with provided CODE…"
-          Start-Process -FilePath $crdPath -ArgumentList ($args -join ' ') -WindowStyle Hidden
+          $args  = @("--code=$code","--redirect-url=$redir","--name=$env:COMPUTERNAME")
+          Start-Process $crdExe -ArgumentList $args -WindowStyle Hidden
+          Write-Host "Started Chrome Remote Desktop host with provided CODE."
 
-      - name: Keep alive
+      - name: Keep alive (~${{ steps.cfg.outputs.runtime }} min)
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
-
-          $test = "${{ inputs.test_mode }}".ToString().ToLower() -in @("true","1","yes","on")
-          $runtime = if($test){ 5 } else { IntOr("${{ inputs.runtime_minutes }}",355) }
-          if(-not $test -and $runtime -lt 6){ $runtime = 355 }
-          if($runtime -gt 355){ $runtime = 355 }
-
-          Write-Host "Runtime (minutes): $runtime"
-
-          $end=(Get-Date).AddMinutes($runtime); $lastHour=-1
+          $ErrorActionPreference="SilentlyContinue"
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
+          $end=(Get-Date).AddMinutes($mins); $tick=0
           while((Get-Date) -lt $end){
             $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
-            Write-Host "RDP alive... ($left min left)"
-            $hr=[int][math]::Floor($left/60)
-            if($hr -ne $lastHour){ $lastHour=$hr; Write-Host "Hour tick: $hr" }
+            if(($tick % 30) -eq 0){ Write-Host "Alive… $left min left"; }
             Start-Sleep -Seconds 60
+            $tick++
           }
+          Write-Host "Keep-alive finished."
 
       - name: Purge bullet* devices (end)
-        if: ${{ inputs.purge_bullet == 'true' || inputs.purge_bullet == 'True' }}
+        if: ${{ steps.cfg.outputs.purge == 'True' }}
+        shell: pwsh
         env:
           TAILNET:  ${{ inputs.ts_tailnet }}
           APIKEY:   ${{ inputs.ts_api_key }}
         run: |
-          $ErrorActionPreference="Continue"
-          function Purge(){
-            param($Tailnet,$ApiKey)
-            try{
-              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($ApiKey):"))
-              $hdr  = @{ Authorization = "Basic $auth"; Accept = "application/json" }
-              $url  = "https://api.tailscale.com/api/v2/tailnet/$Tailnet/devices"
-              $r    = Invoke-RestMethod -Method GET -Uri $url -Headers $hdr -UseBasicParsing
-              foreach($d in $r.devices){
-                if($d.hostname -match '^(?i)bullet(\d+)?$'){
-                  try{
-                    Invoke-RestMethod -Method DELETE -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null
-                    Write-Host "Purged device $($d.hostname) ($($d.id))"
-                  }catch{ Write-Host "WARN purge $($d.hostname): $($_.Exception.Message)" }
-                }
-              }
-            }catch{ Write-Host "WARN purge list: $($_.Exception.Message)" }
+          $ErrorActionPreference = "Continue"
+          $pair = "$env:TAILNET:$env:APIKEY"
+          $b64  = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $hdrs = @{ Authorization = "Basic $b64"; Accept = "application/json" }
+
+          try {
+            $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$($env:TAILNET)/devices" -Headers $hdrs -Method GET
+            $targets = @($list.devices | Where-Object { $_.hostname -match '^bullet(\d+)?$' -or $_.hostname -like 'bullet*' })
+            foreach($d in $targets){
+              Write-Host "Deleting device $($d.hostname) / $($d.id)"
+              Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $hdrs -Method DELETE | Out-Null
+              Start-Sleep -Milliseconds 300
+            }
+          } catch {
+            Write-Host "Purge warning (end): $($_.Exception.Message)"
           }
-          Purge -Tailnet $env:TAILNET -ApiKey $env:APIKEY
