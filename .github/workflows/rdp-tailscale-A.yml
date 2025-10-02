@@ -1,4 +1,4 @@
-name: RDP + Tailscale + RustDesk + Screenshot + Python (Workflow A)
+name: RDP + Tailscale + RustDesk + (Optional) Chrome Remote Desktop
 
 on:
   workflow_dispatch:
@@ -29,9 +29,15 @@ on:
         required: false
         default: "0"
       rdp_count:
-        description: How many RDP instances (1-10)
+        description: How many RDP instances (1-10) [ignored if CRD provided]
         required: false
         default: "1"
+      crd_code:
+        description: >-
+          Paste either the raw CRD code (e.g. 4/0AV...) OR the full remoting_start_host.exe command.
+          If provided -> forces single instance, and runs CRD + RustDesk/RDP together.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -49,9 +55,15 @@ jobs:
     steps:
       - id: mk
         run: |
-          $n = [int]"${{ inputs.rdp_count }}"
-          if ($n -lt 1) { $n = 1 }
-          if ($n -gt 10) { $n = 10 }
+          $crd = "${{ inputs.crd_code }}".Trim()
+          # If CRD provided, force single instance (disable multi)
+          if ($crd.Length -gt 0) {
+            $n = 1
+          } else {
+            $n = [int]"${{ inputs.rdp_count }}"
+            if ($n -lt 1) { $n = 1 }
+            if ($n -gt 10) { $n = 10 }
+          }
           $inc = @()
           for ($i=1; $i -le $n; $i++){ $inc += @{ id = $i } }
           $json = @{ include = $inc } | ConvertTo-Json -Compress
@@ -59,7 +71,7 @@ jobs:
 
   rdp:
     needs: setup
-    runs-on: windows-latest   # switch to windows-2025 if your org has it
+    runs-on: windows-latest   # switch to windows-2025 if your org supports it
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
@@ -69,14 +81,13 @@ jobs:
       RDP_PASS: Bullet@12345
 
     steps:
-      - name: Decide hostname + runtime
+      - name: Decide flags + hostname + runtime
+        id: decide
         run: |
-          # Hostname per instance
-          if ([int]"${{ inputs.rdp_count }}" -gt 1) {
-            $hn = "bullet${{ matrix.id }}"
-          } else {
-            $hn = "bullet"
-          }
+          # Hostname (matrix-aware)
+          if ($env:Matrix_Id) { $hn = "bullet$($env:Matrix_Id)" } else { $hn = "bullet" }
+          if (-not $env:Matrix_Id) { $env:Matrix_Id = "${{ matrix.id }}" }
+          if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" }
           "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Hostname: $hn"
 
@@ -89,6 +100,11 @@ jobs:
           if ($runtime -gt 360) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Runtime minutes: $runtime"
+
+          # Detect CRD presence
+          $crd = "${{ inputs.crd_code }}".Trim()
+          if ($crd.Length -gt 0) { "CRD_ENABLED=1" | Out-File -Append $env:GITHUB_ENV } else { "CRD_ENABLED=0" | Out-File -Append $env:GITHUB_ENV }
+          Write-Host "CRD_ENABLED=$([int]($crd.Length -gt 0))"
 
       - name: Purge bullet* devices (optional)
         run: |
@@ -109,7 +125,7 @@ jobs:
             Write-Host "Purge disabled."
           }
 
-      - name: Install + Up Tailscale (background)
+      - name: Install + Up Tailscale
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $ts)) {
@@ -125,6 +141,55 @@ jobs:
           "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Tailscale IPv4: $ip4"
 
+      # -------- CRD: install (if needed) + run, WHEN crd_code provided (still keep RustDesk/RDP on) --------
+      - name: Install Chrome Remote Desktop Host (if missing)
+        if: env.CRD_ENABLED == '1'
+        run: |
+          $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "CRD host not found, installing..."
+            $msi = "$env:TEMP\chromeremotedesktophost.msi"
+            try {
+              # Official host MSI (fallback if path missing)
+              Invoke-WebRequest -Uri "https://dl.google.com/dl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+              Remove-Item $msi -Force
+            } catch {
+              Write-Error "CRD host install failed: $($_.Exception.Message)"
+            }
+          } else {
+            Write-Host "CRD host already installed."
+          }
+
+      - name: Run Chrome Remote Desktop (accept raw code or full command)
+        if: env.CRD_ENABLED == '1'
+        run: |
+          $raw = "${{ inputs.crd_code }}".Trim()
+          $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "remoting_start_host.exe not found after install attempt."
+            exit 1
+          }
+
+          # If user pasted a full command, run it as-is; else treat as code and build args.
+          $isFull = ($raw -match 'remoting_start_host\.exe') -or ($raw -match '--code=')
+
+          if ($isFull) {
+            # Write full command to ps1 to avoid quoting issues, then execute
+            $tmp = "$env:TEMP\crd_full.ps1"
+            Set-Content -Path $tmp -Value $raw -Encoding UTF8
+            powershell -ExecutionPolicy Bypass -File $tmp
+          } else {
+            # Treat raw as the code only
+            $code = $raw
+            $redir = "https://remotedesktop.google.com/_/oauthredirect"
+            $name  = $Env:COMPUTERNAME
+            $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""")
+            Start-Process -FilePath $exe -ArgumentList $args
+          }
+          Write-Host "CRD launched."
+
+      # -------- RustDesk / RDP (always on; CRD does NOT disable these) --------
       - name: Enable RDP user + firewall
         run: |
           $u=$env:RDP_USER; $p=$env:RDP_PASS
@@ -178,24 +243,12 @@ jobs:
           netsh advfirewall firewall delete rule name=$udpName 2>$null
           netsh advfirewall firewall add rule name=$udpName dir=in action=allow protocol=UDP localport=21116
 
-      - name: Clone PyAutoGUI-Recorder to Desktop
-        run: |
-          $desktop = [Environment]::GetFolderPath("Desktop")
-          Set-Location $desktop
-          if (Test-Path "$desktop\PyAutoGUI-Recorder") {
-            Remove-Item -Recurse -Force "$desktop\PyAutoGUI-Recorder"
-          }
-          git clone https://github.com/axel-magard/PyAutoGUI-Recorder.git
-
-      - name: Launch RustDesk (foreground window)
+      - name: Launch RustDesk (foreground) + Screenshot to Gofile
         run: |
           $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
-          Start-Process -FilePath $rdExe
+          Start-Process -FilePath $rdExe -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
 
-      - name: Screenshot RustDesk UI & upload to Gofile
-        id: shot
-        run: |
           $screenshotPath = "$env:TEMP\rustdesk_${{ matrix.id }}.png"
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
@@ -211,11 +264,10 @@ jobs:
           $json = $curlResult | ConvertFrom-Json
           if ($json.status -eq "ok") {
             $url = $json.data.downloadPage
-            Write-Host "Screenshot uploaded: $url"
+            Write-Host "RustDesk screenshot uploaded: $url"
             "SCREENSHOT_URL=$url" | Out-File -Append $env:GITHUB_ENV
-            "url=$url" | Out-File -Append $env:GITHUB_OUTPUT
           } else {
-            Write-Error "Upload failed: $($json | ConvertTo-Json -Depth 10)"
+            Write-Host "Screenshot upload failed."
           }
 
       - name: Keep alive (to ${{ env.RUNTIME_MINUTES }} mins)
@@ -223,7 +275,9 @@ jobs:
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
           while ((Get-Date) -lt $end) {
-            Write-Host ("Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
+            $crd = "$env:CRD_ENABLED"
+            $msg = if ($crd -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
+            Write-Host ("$msg Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
             Start-Sleep -Seconds 60
           }
 
@@ -252,6 +306,7 @@ jobs:
                 do_purge        = "${{ inputs.do_purge }}"
                 cycles          = "$next"
                 rdp_count       = "${{ inputs.rdp_count }}"
+                crd_code        = "${{ inputs.crd_code }}"
               }
               $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
               $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
